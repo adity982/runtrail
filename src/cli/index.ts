@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
 import { Command } from "commander";
@@ -14,7 +14,18 @@ import {
   readRequestTimeoutMs
 } from "../shared/httpClient.js";
 import { verifyEventChain } from "../shared/receipts.js";
-import { type AgentEvent, healthResponseSchema } from "../shared/schemas.js";
+import {
+  type AgentContext,
+  type AgentEvent,
+  createRunRequestSchema,
+  healthResponseSchema,
+  type PrepareWorkResponse,
+  prepareWorkQuerySchema,
+  workflowReviewPacketSchema
+} from "../shared/schemas.js";
+import { buildBrief, formatBrief } from "./brief.js";
+import { captureCommand } from "./commandCapture.js";
+import { doctorReport, formatDoctor } from "./doctor.js";
 import {
   enqueueOutbox,
   listOutbox,
@@ -23,6 +34,7 @@ import {
   removeOutboxRecord,
   updateOutboxRetry
 } from "./outbox.js";
+import { formatReviewReport } from "./reviewReport.js";
 
 export async function runCli(argv = process.argv): Promise<void> {
   if (argv[2] === "run" && argv[3] !== "create") {
@@ -35,6 +47,16 @@ export async function runCli(argv = process.argv): Promise<void> {
   program.name("rt").description("Runtrail CLI").showHelpAfterError().exitOverride();
 
   program.command("health").description("Check Runtrail service health").action(health);
+  program
+    .command("doctor")
+    .description("Diagnose service access and local capture state without changing anything")
+    .option("--json", "Print machine-readable JSON", false)
+    .action(async (options: { json: boolean }) => {
+      const report = await doctorReport();
+      if (options.json) printJson(report);
+      else console.log(formatDoctor(report));
+      if (!report.ok) process.exitCode = 1;
+    });
   program
     .command("capabilities")
     .description("Discover supported Runtrail protocol capabilities")
@@ -58,6 +80,16 @@ export async function runCli(argv = process.argv): Promise<void> {
     .option("--min-importance <importance>", "Minimum event importance", parseInteger)
     .option("--cursor <cursor>", "Opaque cursor from the previous response")
     .action(context);
+  program
+    .command("brief")
+    .description("Read a bounded work brief with sources and evidence limitations")
+    .requiredOption("--project <project>", "Project name")
+    .option("--source <source>", "Agent or integration source")
+    .option("--work-key <workKey>", "Canonical external work identifier")
+    .option("--run-id <runId>", "Existing run to continue")
+    .option("--limit <limit>", "Maximum items per section (1-20)", parseInteger, 5)
+    .option("--json", "Print versioned machine-readable JSON", false)
+    .action(brief);
   program
     .command("prepare-work")
     .description("Fetch deterministic continuation guidance before editing")
@@ -113,7 +145,8 @@ export async function runCli(argv = process.argv): Promise<void> {
     .requiredOption("--workflow-id <workflowId>", "Workflow identifier")
     .requiredOption("--project <project>", "Project name")
     .option("--limit <limit>", "Maximum items per section", parseInteger)
-    .option("--output <path>", "Write packet JSON to a file")
+    .option("--format <format>", "json or markdown", "json")
+    .option("--output <path>", "Write the packet or report to a file")
     .option("--force", "Overwrite an existing output file", false)
     .action(readWorkflowPacket);
 
@@ -396,6 +429,32 @@ async function prepareWork(options: {
   printJson(await requestJson(`/agent/prepare-work?${query.toString()}`));
 }
 
+async function brief(options: {
+  project: string;
+  source?: string;
+  workKey?: string;
+  runId?: string;
+  limit: number;
+  json: boolean;
+}): Promise<void> {
+  const parsed = prepareWorkQuerySchema.parse(options);
+  const query = new URLSearchParams({ project: parsed.project, limit: String(parsed.limit) });
+  appendQuery(query, "source", parsed.source);
+  appendQuery(query, "workKey", parsed.workKey);
+  appendQuery(query, "runId", parsed.runId);
+  const contextQuery = new URLSearchParams({
+    project: parsed.project,
+    limit: String(parsed.limit)
+  });
+  const [prepared, context] = await Promise.all([
+    requestJson(`/agent/prepare-work?${query.toString()}`),
+    requestJson(`/agent/context?${contextQuery.toString()}`)
+  ]);
+  const report = buildBrief(prepared as PrepareWorkResponse, context as AgentContext, parsed.limit);
+  if (options.json) printJson(report);
+  else console.log(formatBrief(report));
+}
+
 async function createRun(options: {
   source: string;
   project: string;
@@ -478,8 +537,11 @@ async function readWorkflowPacket(options: {
   project: string;
   limit?: number;
   output?: string;
+  format: string;
   force: boolean;
 }): Promise<void> {
+  if (!["json", "markdown"].includes(options.format))
+    throw new Error("Expected --format json or markdown");
   if (options.output && existsSync(options.output) && !options.force) {
     throw new Error(`Refusing to overwrite ${options.output}; pass --force to replace it`);
   }
@@ -488,8 +550,15 @@ async function readWorkflowPacket(options: {
   const packet = await requestJson(
     `/workflows/${encodeURIComponent(options.workflowId)}/review-packet?${query.toString()}`
   );
-  if (!options.output) return printJson(packet);
-  writeFileSync(options.output, `${JSON.stringify(packet, null, 2)}\n`, {
+  const rendered =
+    options.format === "markdown"
+      ? formatReviewReport(workflowReviewPacketSchema.parse(packet))
+      : JSON.stringify(packet, null, 2);
+  if (!options.output) {
+    console.log(rendered);
+    return;
+  }
+  writeFileSync(options.output, `${rendered.trimEnd()}\n`, {
     flag: options.force ? "w" : "wx"
   });
   console.log(`Wrote ${options.output}`);
@@ -504,6 +573,7 @@ async function wrapRun(
     agentName?: string;
     agentModel?: string;
     workflowId?: string;
+    workKey?: string;
     parentRunId?: string;
     continuedFromRunId?: string;
     category?: string;
@@ -522,169 +592,224 @@ async function wrapRun(
     throw new Error("A command is required after --");
   }
 
-  await bestEffortWrapperWrite(() => retryOutbox(false));
-  const config = loadConfig();
+  createRunRequestSchema.parse({ ...options, tags: options.tags });
+  let degraded = false;
+  const limitations: string[] = [];
+  const attempt = async (action: () => Promise<unknown>): Promise<unknown> => {
+    try {
+      return await action();
+    } catch {
+      degraded = true;
+      console.error(
+        "Runtrail capture degraded; inspect rt doctor and rt outbox list. Command execution continues."
+      );
+      return undefined;
+    }
+  };
+  let deadline = Date.now() + 1500;
+  const record = (
+    requestPath: string,
+    init: { method?: string; body?: Record<string, unknown> },
+    queue?: { operation: string; idempotencyKey: string }
+  ) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Wrapper telemetry budget exhausted");
+    return requestJson(requestPath, init, queue, remaining);
+  };
+  let logDir: string | undefined;
+  try {
+    logDir = loadConfig().storage.logDir;
+  } catch {
+    degraded = true;
+  }
   const wrapperKey = randomUUID();
   const cwd = process.cwd();
   const gitBefore = readGitSnapshot(cwd);
-  const created = await requestJson(
-    "/runs",
-    {
-      method: "POST",
-      body: compact({
-        source: options.source,
-        project: options.project,
-        agentName: options.agentName,
-        agentModel: options.agentModel,
-        clientRunId: `wrapper-${wrapperKey}`,
-        task: options.task,
-        workflowId: options.workflowId,
-        parentRunId: options.parentRunId,
-        continuedFromRunId: options.continuedFromRunId,
-        hostname: hostname(),
-        cwd,
-        gitRepoPath: gitBefore.repoPath,
-        gitBranch: gitBefore.branch,
-        gitCommit: gitBefore.commit,
-        category: options.category,
-        tags: options.tags,
-        startedAt: new Date().toISOString()
-      })
-    },
-    { operation: "create_run", idempotencyKey: `wrapper-${wrapperKey}` }
+  const created = await attempt(() =>
+    record(
+      "/runs",
+      {
+        method: "POST",
+        body: compact({
+          source: options.source,
+          project: options.project,
+          agentName: options.agentName,
+          agentModel: options.agentModel,
+          clientRunId: `wrapper-${wrapperKey}`,
+          task: options.task,
+          workflowId: options.workflowId,
+          workKey: options.workKey,
+          parentRunId: options.parentRunId,
+          continuedFromRunId: options.continuedFromRunId,
+          hostname: hostname(),
+          cwd,
+          gitRepoPath: gitBefore.repoPath,
+          gitBranch: gitBefore.branch,
+          gitCommit: gitBefore.commit,
+          category: options.category,
+          tags: options.tags,
+          startedAt: new Date().toISOString()
+        })
+      },
+      { operation: "create_run", idempotencyKey: `wrapper-${wrapperKey}` }
+    )
   );
-  const runId = readResponseId(created, "run");
+  let runId: string | undefined;
+  try {
+    runId = readResponseId(created, "run");
+  } catch {
+    degraded = true;
+  }
+  if (!runId)
+    limitations.push(
+      "Remote run ID unavailable. Only a safe keyed run create may be queued; command result, verification and completion cannot be recovered by sync."
+    );
   const expectedVersion = readResponseVersion(created, "run");
-  const logPath = path.join(config.storage.logDir, `${runId}.log`);
-
-  mkdirSync(config.storage.logDir, { recursive: true });
+  const logPath = logDir ? path.join(logDir, `local-${wrapperKey}.log`) : undefined;
+  try {
+    if (logDir) mkdirSync(logDir, { recursive: true, mode: 0o700 });
+  } catch {
+    degraded = true;
+  }
 
   const commandStartedAt = Date.now();
-  const exitCode = await runCommand(command, logPath);
+  const { exitCode, signal, logStored } = await captureCommand(command, logPath);
+  // Set this before any optional post-command observation can fail.
+  process.exitCode = exitCode;
+  if (!logStored) {
+    degraded = true;
+    limitations.push("Local log unavailable or truncated; stdout/stderr were forwarded.");
+  }
   const durationMs = Date.now() - commandStartedAt;
   const gitAfter = readGitSnapshot(cwd);
   const changedFiles = gitAfter.repoPath ? readChangedFiles(cwd) : [];
   const status = exitCode === 0 ? "completed" : "failed";
 
-  await bestEffortWrapperWrite(() =>
-    requestJson(
-      "/events",
-      {
-        method: "POST",
-        body: {
-          runId,
-          clientRecordId: `wrapper-${wrapperKey}-command`,
-          type: "command_executed",
-          message: `Executed ${path.basename(command[0] ?? "command")}`,
-          importance: exitCode === 0 ? 4 : 7,
-          category: options.category,
-          tags: options.tags,
-          data: {
-            argv: sanitizeCommandArgv(command),
-            exitCode,
-            durationMs,
-            logPath,
-            gitBefore,
-            gitAfter
-          }
-        }
-      },
-      { operation: "create_event", idempotencyKey: `wrapper-${wrapperKey}-command` }
-    )
-  );
-  const verificationKind = verificationKindForCommand(command);
-  await bestEffortWrapperWrite(() =>
-    requestJson(
-      "/verifications",
-      {
-        method: "POST",
-        body: {
-          runId,
-          clientRecordId: `wrapper-${wrapperKey}-verification`,
-          checkId: "wrapper-command",
-          kind: verificationKind,
-          outcome: exitCode === 0 ? "passed" : "failed",
-          name: verificationKind === "custom" ? "wrapped command" : `${verificationKind} check`,
-          commandSummary: verificationCommandSummary(command),
-          durationMs,
-          support: { type: "exit_code", exitCode },
-          completedAt: new Date().toISOString()
-        }
-      },
-      {
-        operation: "create_verification",
-        idempotencyKey: `wrapper-${wrapperKey}-verification`
-      }
-    )
-  );
-  if (changedFiles.length > 0) {
-    await bestEffortWrapperWrite(() =>
-      requestJson(
+  deadline = Date.now() + 1500;
+  if (runId) {
+    await attempt(() =>
+      record(
         "/events",
         {
           method: "POST",
           body: {
             runId,
-            clientRecordId: `wrapper-${wrapperKey}-files`,
-            type: "files_changed",
-            message: `${changedFiles.length} file${changedFiles.length === 1 ? "" : "s"} changed`,
-            importance: 4,
+            clientRecordId: `wrapper-${wrapperKey}-command`,
+            type: "command_executed",
+            message: `Executed ${path.basename(command[0] ?? "command")}`,
+            importance: exitCode === 0 ? 4 : 7,
             category: options.category,
             tags: options.tags,
-            data: { changedFiles }
+            data: {
+              argv: sanitizeCommandArgv(command),
+              exitCode,
+              durationMs,
+              logPath: logStored ? logPath : undefined,
+              signal,
+              logStored,
+              gitBefore,
+              gitAfter
+            }
           }
         },
-        { operation: "create_event", idempotencyKey: `wrapper-${wrapperKey}-files` }
+        { operation: "create_event", idempotencyKey: `wrapper-${wrapperKey}-command` }
       )
     );
-  }
-  await bestEffortWrapperWrite(() =>
-    requestJson(
-      "/events",
-      {
-        method: "POST",
-        body: {
-          runId,
-          clientRecordId: `wrapper-${wrapperKey}-result`,
-          type: status,
-          message:
-            exitCode === 0 ? "Command completed" : `Command failed with exit code ${exitCode}`,
-          importance: exitCode === 0 ? 5 : 8,
-          category: options.category,
-          tags: options.tags,
-          data: { exitCode }
+    const verificationKind = verificationKindForCommand(command);
+    await attempt(() =>
+      record(
+        "/verifications",
+        {
+          method: "POST",
+          body: {
+            runId,
+            clientRecordId: `wrapper-${wrapperKey}-verification`,
+            checkId: "wrapper-command",
+            kind: verificationKind,
+            outcome: exitCode === 0 ? "passed" : "failed",
+            name: verificationKind === "custom" ? "wrapped command" : `${verificationKind} check`,
+            commandSummary: verificationCommandSummary(command),
+            durationMs,
+            support: { type: "exit_code", exitCode },
+            completedAt: new Date().toISOString()
+          }
+        },
+        {
+          operation: "create_verification",
+          idempotencyKey: `wrapper-${wrapperKey}-verification`
         }
-      },
-      { operation: "create_event", idempotencyKey: `wrapper-${wrapperKey}-result` }
-    )
-  );
-  await bestEffortWrapperWrite(() =>
-    requestJson(`/runs/${encodeURIComponent(runId)}`, {
-      method: "PATCH",
-      body: compact({
-        status,
-        expectedVersion,
-        summary: exitCode === 0 ? "Command completed" : `Command failed with exit code ${exitCode}`,
-        completedAt: new Date().toISOString(),
-        gitBranch: gitAfter.branch,
-        gitCommit: gitAfter.commit
+      )
+    );
+    if (changedFiles.length > 0) {
+      await attempt(() =>
+        record(
+          "/events",
+          {
+            method: "POST",
+            body: {
+              runId,
+              clientRecordId: `wrapper-${wrapperKey}-files`,
+              type: "files_changed",
+              message: `${changedFiles.length} file${changedFiles.length === 1 ? "" : "s"} changed`,
+              importance: 4,
+              category: options.category,
+              tags: options.tags,
+              data: { changedFiles }
+            }
+          },
+          { operation: "create_event", idempotencyKey: `wrapper-${wrapperKey}-files` }
+        )
+      );
+    }
+    await attempt(() =>
+      record(
+        "/events",
+        {
+          method: "POST",
+          body: {
+            runId,
+            clientRecordId: `wrapper-${wrapperKey}-result`,
+            type: status,
+            message:
+              exitCode === 0 ? "Command completed" : `Command failed with exit code ${exitCode}`,
+            importance: exitCode === 0 ? 5 : 8,
+            category: options.category,
+            tags: options.tags,
+            data: { exitCode }
+          }
+        },
+        { operation: "create_event", idempotencyKey: `wrapper-${wrapperKey}-result` }
+      )
+    );
+    await attempt(() =>
+      record(`/runs/${encodeURIComponent(runId)}`, {
+        method: "PATCH",
+        body: compact({
+          status,
+          expectedVersion,
+          summary:
+            exitCode === 0 ? "Command completed" : `Command failed with exit code ${exitCode}`,
+          completedAt: new Date().toISOString(),
+          gitBranch: gitAfter.branch,
+          gitCommit: gitAfter.commit
+        })
       })
-    })
-  );
-  await bestEffortWrapperWrite(() => retryOutbox(false));
-
-  printJson({ runId, status, exitCode, logPath });
-  process.exitCode = exitCode;
-}
-
-async function bestEffortWrapperWrite(action: () => Promise<unknown>): Promise<void> {
-  try {
-    await action();
-  } catch (error) {
-    console.error(
-      error instanceof Error ? error.message : "Runtrail write failed; work may be unsynced"
     );
   }
+  if (degraded)
+    limitations.push(
+      "Remote capture is incomplete; queued POSTs need explicit rt sync. Completion PATCH is never queued. Reconcile any running record explicitly."
+    );
+  printJson({
+    runId: runId ?? null,
+    status,
+    exitCode,
+    signal,
+    logPath: logStored ? logPath : null,
+    capture: degraded ? "degraded" : "stored",
+    limitations
+  });
+  process.exitCode = exitCode;
 }
 
 function verificationKindForCommand(
@@ -718,6 +843,7 @@ async function wrapRunFromArgv(args: string[]): Promise<void> {
     agentName?: string;
     agentModel?: string;
     workflowId?: string;
+    workKey?: string;
     parentRunId?: string;
     continuedFromRunId?: string;
   } = {};
@@ -745,6 +871,7 @@ async function wrapRunFromArgv(args: string[]): Promise<void> {
       value === "--agent-model" ||
       value === "--category" ||
       value === "--workflow-id" ||
+      value === "--work-key" ||
       value === "--parent-run-id" ||
       value === "--continued-from-run-id"
     ) {
@@ -764,6 +891,8 @@ async function wrapRunFromArgv(args: string[]): Promise<void> {
         options.agentName = next;
       } else if (value === "--agent-model") {
         options.agentModel = next;
+      } else if (value === "--work-key") {
+        options.workKey = next;
       } else if (value === "--workflow-id") {
         options.workflowId = next;
       } else if (value === "--parent-run-id") {
@@ -801,6 +930,7 @@ async function wrapRunFromArgv(args: string[]): Promise<void> {
     agentModel: options.agentModel,
     category: options.category,
     workflowId: options.workflowId,
+    workKey: options.workKey,
     parentRunId: options.parentRunId,
     continuedFromRunId: options.continuedFromRunId,
     tags: optionTags(options.tag)
@@ -1163,10 +1293,11 @@ async function verifyRun(runId: string): Promise<void> {
 async function requestJson(
   path: string,
   options: { method?: string; body?: Record<string, unknown> } = {},
-  queue?: { operation: string; idempotencyKey: string }
+  queue?: { operation: string; idempotencyKey: string },
+  timeoutLimitMs?: number
 ): Promise<unknown> {
   const config = loadConfig();
-  const timeoutMs = readRequestTimeoutMs();
+  const timeoutMs = Math.min(readRequestTimeoutMs(), timeoutLimitMs ?? Number.POSITIVE_INFINITY);
   const method = options.method ?? "GET";
   const headers = new Headers();
 
@@ -1180,6 +1311,7 @@ async function requestJson(
 
   const context = { method, path, token: config.security.token };
   let response: Response;
+  let body: unknown;
 
   try {
     response = await fetchWithTimeout(
@@ -1187,10 +1319,14 @@ async function requestJson(
       {
         method: options.method,
         body: options.body ? JSON.stringify(options.body) : undefined,
-        headers
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: "error"
       },
       timeoutMs
     );
+    const text = await response.text();
+    body = text ? parseJsonBody(text) : undefined;
   } catch (error) {
     const failure = formatClientFailure(error, timeoutMs, context);
     if (queue && options.method === "POST" && options.body) {
@@ -1198,9 +1334,6 @@ async function requestJson(
     }
     throw failure;
   }
-
-  const text = await response.text();
-  const body = text ? parseJsonBody(text) : undefined;
 
   if (!response.ok) {
     const failure = formatHttpFailure(response.status, body, context);
@@ -1470,37 +1603,6 @@ function readResponseVersion(response: unknown, key: string): number | undefined
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-async function runCommand(command: string[], logPath: string): Promise<number> {
-  const [executable, ...args] = command;
-  const log = createWriteStream(logPath, { flags: "a" });
-
-  return await new Promise((resolve, reject) => {
-    const child = spawn(executable, args, {
-      cwd: process.cwd(),
-      env: process.env,
-      stdio: ["inherit", "pipe", "pipe"],
-      shell: false
-    });
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      process.stdout.write(chunk);
-      log.write(chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      process.stderr.write(chunk);
-      log.write(chunk);
-    });
-    child.on("error", (error) => {
-      log.end();
-      reject(error);
-    });
-    child.on("close", (code) => {
-      log.end();
-      resolve(code ?? 1);
-    });
-  });
-}
-
 const secretBearingFlags = new Set([
   "--api-key",
   "--authorization",
@@ -1574,7 +1676,9 @@ function readGitValue(cwd: string, args: string[]): string | undefined {
     const value = execFileSync("git", args, {
       cwd,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1000,
+      maxBuffer: 256 * 1024
     }).trim();
 
     return value.length > 0 ? value : undefined;

@@ -1,3 +1,10 @@
+# [1.42.0](https://github.com/redxzeta/runtrail/compare/v1.41.3...v1.42.0) (2026-10-28)
+
+
+### Features
+
+* **cli:** make daily capture resilient and work evidence readable ([#208](https://github.com/redxzeta/runtrail/issues/208)) ([bdd11e1](https://github.com/redxzeta/runtrail/commit/bdd11e1c445a8f5f8c3a01fe9f39017359eb8ba4)), closes [#207](https://github.com/redxzeta/runtrail/issues/207)
+
 ## [1.41.3](https://github.com/redxzeta/runtrail/compare/v1.41.2...v1.41.3) (2026-07-26)
 
 

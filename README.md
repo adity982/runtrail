@@ -73,6 +73,8 @@ Check health:
 ```sh
 curl http://127.0.0.1:8787/health
 pnpm cli health
+pnpm cli doctor
+pnpm cli doctor --json
 ```
 
 Discover optional protocol support before feature-specific calls:
@@ -81,6 +83,11 @@ Discover optional protocol support before feature-specific calls:
 curl -H "authorization: Bearer $RUNTRAIL_TOKEN" http://127.0.0.1:8787/meta/capabilities
 pnpm cli capabilities --json
 ```
+
+`doctor` only reads service health, authenticated capabilities, local path access
+and outbox state. It never opens/migrates SQLite, creates directories, replays
+writes or reconfigures the host. Missing local storage can be expected when the
+service is remote. Diagnostics omit tokens, service URLs and local paths.
 
 The versioned manifest advertises stable feature identifiers, schema versions, MCP transports and
 tools, and actual default/maximum list limits. Unknown feature identifiers are additive and safe to
@@ -121,6 +128,46 @@ Prepare a deterministic working set before editing:
 ```sh
 pnpm cli prepare-work --project runtrail --source codex --work-key github:redxzeta/runtrail#114 --limit 10
 ```
+
+## Daily work loop
+
+Use an already configured local service and token. Diagnose access, start or
+recover work, capture real commands, then hand off with evidence limitations:
+
+```sh
+pnpm cli doctor
+pnpm cli prepare-work --project runtrail --work-key github:redxzeta/runtrail#207 --limit 5
+pnpm cli run --source developer --project runtrail --task "check daily workflow" \
+  --work-key github:redxzeta/runtrail#207 --workflow-id issue-207 -- pnpm test
+pnpm cli brief --project runtrail --work-key github:redxzeta/runtrail#207 --limit 5
+pnpm cli brief --project runtrail --run-id "$RUN_ID" --json
+pnpm cli handoff create --source-run-id "$RUN_ID" --from-source developer \
+  --to-source reviewer --project runtrail --summary "Capture changes ready for review" \
+  --next-action "Inspect failed checks and revision applicability before continuing"
+pnpm cli workflow packet --project runtrail --workflow-id issue-207 \
+  --format markdown --output review.md
+```
+
+Set `RUN_ID` to the confirmed ID in the capture result. If it is null, treat the
+work as locally captured with incomplete remote metadata. Reread a run/handoff's
+version before an explicit accept, resume or finish; use `--continued-from-run-id`
+to connect later captured commands. A brief is a bounded observation, with
+timestamps, source IDs, incomplete coverage and evidence gaps. Its default is
+readable Markdown; `--json` returns schema version `1`. It uses two existing
+read requests (prepare-work and context), which are separate observations.
+
+Packet JSON remains the default; `--format markdown` renders the same packet.
+Neither completion nor a receipt/hash proves verification or deployment.
+Revision references identify recorded code; verification applicability remains
+unknown because verification records do not bind a revision and dirty-worktree
+state. Packet exports omit verbose task, handoff and blocker text by design;
+inspect linked source records for details.
+
+MCP clients can use the existing `journal_prepare_work`, `journal_get_context`,
+handoff lifecycle and `journal_get_workflow_review_packet` tools. No new tool
+catalog or scheduler is needed. CLI and protocol-client coverage are recorded
+in the [issue-207 results report](docs/results/207-daily-workflow.md). Native T3 completion import is a remaining
+milestone; this walkthrough does not claim a tested T3 client integration.
 
 ## Contributing
 
@@ -256,6 +303,23 @@ Wrap a command and journal its result:
 pnpm cli run --source codex --project runtrail --task "fix retry logic" -- pnpm test
 pnpm cli run --source codex --project runtrail --task "fix retry logic" --category implementation --tag codex --tag issue-123 -- pnpm test
 ```
+
+The command runs once even if recorder setup, authentication, connectivity or
+local log capture fails. Invalid wrapper arguments still fail before execution.
+Telemetry has a 1.5-second budget before the command and another 1.5 seconds
+after it (a smaller `RUNTRAIL_REQUEST_TIMEOUT_MS` is respected). The wrapper
+does not drain the outbox; choose `pnpm cli sync` explicitly. Exit codes are
+preserved; signal exits use `128 + signal number` and include the signal in the
+result. SIGINT/SIGTERM received by the wrapper are forwarded to its direct child.
+
+The final result distinguishes `capture: stored` from `capture: degraded`.
+Without a confirmed server run ID, `runId` is null and only a safe keyed run
+create may be queued. Sync cannot reconstruct that command's result,
+verification or completion; a recovered run may need explicit reconciliation.
+With an ID, safe failed POSTs may be queued, but completion PATCH is never
+replayed. Logs stay local, use private file permissions and are marked
+unavailable if writing fails or storage cannot keep up. Raw log content is never
+uploaded. `stored` describes successful recording, not independent verification.
 
 ## Codex Hooks
 
