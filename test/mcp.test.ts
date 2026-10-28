@@ -23,6 +23,36 @@ describe("mcp adapter", () => {
     vi.restoreAllMocks();
   });
 
+  it("preserves the public tool name contract", () => {
+    expect(runtrailToolNames).toEqual([
+      "journal_start_run",
+      "journal_resume_run",
+      "journal_heartbeat_run",
+      "journal_pause_run",
+      "journal_finish_run",
+      "journal_get_context",
+      "journal_prepare_work",
+      "journal_create_event",
+      "journal_record_verification",
+      "journal_create_open_loop",
+      "journal_resolve_open_loop",
+      "journal_record_decision",
+      "journal_list_decisions",
+      "journal_create_handoff",
+      "journal_list_pending_handoffs",
+      "journal_accept_handoff",
+      "journal_decline_handoff",
+      "journal_complete_handoff",
+      "journal_expire_handoff",
+      "journal_get_run_manifest",
+      "journal_get_workflow",
+      "journal_get_workflow_review_packet",
+      "journal_get_capabilities",
+      "journal_search",
+      "journal_search_runs"
+    ]);
+  });
+
   it("keeps direct and bridge registrations aligned with the authoritative tool set", () => {
     const directNames = registeredToolNames(() =>
       createRuntrailMcpServer(mockClient({ ok: true }))
